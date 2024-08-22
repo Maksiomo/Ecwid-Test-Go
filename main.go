@@ -4,13 +4,13 @@ import (
 	"bufio"
 	"ecwid-go-task/trie"
 	"fmt"
-	"io"
-	"math"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Toscale-platform/kit/env"
 	"github.com/Toscale-platform/kit/log"
 
 	"github.com/joho/godotenv"
@@ -24,11 +24,15 @@ func main() {
 		return
 	}
 
+	start := time.Now()
+
+	// resultMap := make(map[string]int)
+
 	log.Info().Msg("Init trie")
 	trie := trie.NewTrie()
 
 	log.Info().Msg("Init connection to file")
-	file, err := os.Open(os.Getenv("TARGET_FILE_PATH"))
+	file, err := os.Open(env.GetString("TARGET_FILE_PATH"))
 	if err != nil {
 		log.Error().Err(err).Send()
 		return
@@ -36,123 +40,115 @@ func main() {
 
 	defer file.Close()
 
-	start := time.Now()
+	numWorkers := runtime.NumCPU()
+	resultsChan := make(chan map[string]string, numWorkers)
+	var parseWg, saveWg sync.WaitGroup
 
 	log.Info().Msg("Parsing file with ip addresses")
-	err = ParseFile(file, trie)
+	saveWg.Add(1)
+	go func() {
+		resBatch := 0
+		defer saveWg.Done()
+		for recordBatch := range resultsChan {
+			resBatch++
+			if resBatch % 2500 == 0 {
+				log.Info().Msg(fmt.Sprintf("batch %d", resBatch))
+			}
+			for _, record := range recordBatch {
+				err := trie.AddWord(record)
+				if err != nil {
+					log.Error().Err(err).Send()
+				}
 
-	if err != nil {
-		log.Error().Err(err).Send()
-		return
-	}
+				// _, exists := resultMap[record]
+				// if !exists {
+				// 	resultMap[record] = 1
+				// }
+			}
+		}
+	}()
 
-	log.Info().Msg("finish parsing file")
-	count := trie.CountUniqFullWords(trie.Root)
+	buf := make([]byte, env.GetInt("DATA_CHUNK_SIZE"))
+	leftover := make([]byte, 0, env.GetInt("DATA_CHUNK_SIZE"))
+
+	go func() {
+		chunckCount := 0
+		for {
+			bytesRead, err := file.Read(buf)
+			if bytesRead > 0 {
+				chunk := make([]byte, bytesRead)
+				copy(chunk, buf[:bytesRead])
+				validChunk, newLeftover := processChunkWithChans(chunk, leftover)
+				leftover = newLeftover
+				if len(validChunk) > 0 {
+					parseWg.Add(1)
+					chunckCount++
+					if chunckCount % 5000 == 0 {
+						log.Info().Msg(fmt.Sprintf("Processing chunk № %d", chunckCount))
+						parseWg.Done()
+						break
+					}
+					go processChunkData(validChunk, resultsChan, &parseWg)
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		parseWg.Wait()
+		close(resultsChan)
+	}()
+
+	saveWg.Wait()
+
+	// err = ParseFile(file, trie)
+
+	// if err != nil {
+	// 	log.Error().Err(err).Send()
+	// 	return
+	// }
 
 	duration := time.Since(start)
+	log.Info().Msg(fmt.Sprintf("finish parsing file, took %s", duration.String()))
+	count := trie.CountUniqFullWords(trie.Root)
+	// count := len(resultMap)
+	duration = time.Since(start)
 	// show result
-	log.Info().Msg(fmt.Sprintf("Total amount of uniq ip addresses = %d,\n with a total runtime of %s", count, duration.String()))
+	log.Info().Msg(fmt.Sprintf(`Total amount of uniq ip addresses = %d, with a total runtime of %s`, count, duration.String()))
 }
 
-func ParseFile(file *os.File, trie *trie.Trie) error {
-	linesPool := sync.Pool{New: func() interface{} {
-		return make([]byte, 250 * 1024)
-	}}
-
-	stringPool := sync.Pool{New: func() interface{} {
-		lines := ""
-		return &lines
-	}}
-
-	r := bufio.NewReader(file)
-
-	var wg sync.WaitGroup
-
-	for {
-		bufPtr := linesPool.Get() //.([]uint8)
-
-		var buf []byte
-
-		switch v := bufPtr.(type) {
-		default: {
-			log.Error().Err(fmt.Errorf("invalid ptr type %T", v))
-			continue
-		}
-		case *string: {
-			buf = []byte(*bufPtr.(*string))
-		}
-		case []uint8: {
-			buf = []byte(bufPtr.([]uint8))
-		} 
-		}
-
-		n, err := r.Read(buf)
-		buf = buf[:n]
-
-		if n == 0 {
-			if err != nil {
-				fmt.Println(err)
-				break
+func processChunkWithChans(chunk, leftover []byte) (validChunk, newLeftover []byte) {
+	firstNewline := -1
+	lastNewline := -1
+	for i, b := range chunk {
+		if b == '\n' {
+			if firstNewline == -1 {
+				firstNewline = i
 			}
-			if err == io.EOF {
-				break
-			}
-			return err
+			lastNewline = i
 		}
-
-		nextUntillNewline, err := r.ReadBytes('\n')
-
-		if err != io.EOF {
-			buf = append(buf, nextUntillNewline...)
-		}
-
-		wg.Add(1)
-		go func() {
-			ProcessChunk(buf, &linesPool, &stringPool, trie)
-			wg.Done()
-		}()
-
 	}
-
-	wg.Wait()
-	return nil
+	if firstNewline != -1 {
+		validChunk = append(leftover, chunk[:lastNewline+1]...)
+		newLeftover = make([]byte, len(chunk[lastNewline+1:]))
+		copy(newLeftover, chunk[lastNewline+1:])
+	} else {
+		newLeftover = append(leftover, chunk...)
+	}
+	return validChunk, newLeftover
 }
 
-func ProcessChunk(chunk []byte, linesPool, stringPool *sync.Pool, trie *trie.Trie) {
-	var chunkWg sync.WaitGroup
+func processChunkData(chunk []byte, resultsChan chan<- map[string]string, wg *sync.WaitGroup) {
+	defer wg.Done()
 
-	lines := *stringPool.Get().(*string)
-	lines = string(chunk)
+	parsedIps := make(map[string]string)
+	scanner := bufio.NewScanner(strings.NewReader(string(chunk)))
 
-	linesPool.Put(&lines)
-
-	linesSlice := strings.Split(lines, "\n")
-
-	stringPool.Put(&lines)
-
-	chunkSize := 300
-	n := len(linesSlice)
-	totalProcessThreads := n / chunkSize
-
-	if n%chunkSize != 0 {
-		totalProcessThreads++
+	for scanner.Scan() {
+		line := scanner.Text()
+		parsedIps[line] = line
 	}
 
-	for i := 0; i < totalProcessThreads; i++ {
-		chunkWg.Add(1)
-
-		go func(s int, e int) {
-			defer chunkWg.Done()
-			for i := s; i < e; i++ {
-				text := linesSlice[i]
-				if len(text) == 0 {
-					continue
-				}
-				trie.AddWord(text)
-			}
-		}(i*chunkSize, int(math.Min(float64((i+1)*chunkSize), float64(len(linesSlice)))))
-	}
-
-	chunkWg.Wait()
-	linesSlice = nil
+	// Send the computed stats to resultsChan
+	resultsChan <- parsedIps
 }
