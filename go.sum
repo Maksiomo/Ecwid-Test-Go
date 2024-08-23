@@ -1,6 +1,8 @@
 github.com/Toscale-platform/kit v1.5.14 h1:vbQpZSotmEO/zwDkhYhOb17PyE/gjBIcK2Bl3YDNAjE=
 github.com/Toscale-platform/kit v1.5.14/go.mod h1:8mgMHyo84Dfia5uCVCWIttbYLhmcFWcSARhtkZbQeVA=
 github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
+github.com/go-mmap/mmap v0.7.0 h1:+h1n06sZw0IWBwL9YDzTomNNXxM4LH/l+HVpGaTC+qk=
+github.com/go-mmap/mmap v0.7.0/go.mod h1:moN8m00bW6Mpk+Y1xQFeL3xZqycnT4qUAf852ICV/Gc=
 github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
 github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
 github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=

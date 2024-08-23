@@ -2,9 +2,9 @@ package main
 
 import (
 	"bufio"
-	"ecwid-go-task/trie"
+	ipstorage "ecwid-go-task/ipStorage"
+	"ecwid-go-task/utils"
 	"fmt"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -13,6 +13,7 @@ import (
 	"github.com/Toscale-platform/kit/env"
 	"github.com/Toscale-platform/kit/log"
 
+	"github.com/go-mmap/mmap"
 	"github.com/joho/godotenv"
 )
 
@@ -26,68 +27,64 @@ func main() {
 
 	start := time.Now()
 
-	// resultMap := make(map[string]int)
-
-	log.Info().Msg("Init trie")
-	trie := trie.NewTrie()
-
 	log.Info().Msg("Init connection to file")
-	file, err := os.Open(env.GetString("TARGET_FILE_PATH"))
+
+	// memory map our file, putting all necessary pointers to address space,
+	// which significantly boosts reading speed (~70-80%)
+	mmapedFile, err := mmap.Open(env.GetString("TARGET_FILE_PATH"))
 	if err != nil {
 		log.Error().Err(err).Send()
 		return
 	}
+	defer mmapedFile.Close()
 
-	defer file.Close()
-
+	// define how many threads are optimal for pc, 
+	// we don't want to process lines one by one, as it would take ages to work 120gb benchmark 
 	numWorkers := runtime.NumCPU()
-	resultsChan := make(chan map[string]string, numWorkers)
+	// channel to which all processed batches will be passed
+	resultsChan := make(chan map[uint32]bool, numWorkers)
+	// wait groups for synchronisation
 	var parseWg, saveWg sync.WaitGroup
 
 	log.Info().Msg("Parsing file with ip addresses")
+
+	// parse wg logic
 	saveWg.Add(1)
 	go func() {
 		resBatch := 0
 		defer saveWg.Done()
 		for recordBatch := range resultsChan {
 			resBatch++
-			if resBatch % 2500 == 0 {
+			if resBatch % 10000 == 0 {
 				log.Info().Msg(fmt.Sprintf("batch %d", resBatch))
 			}
-			for _, record := range recordBatch {
-				err := trie.AddWord(record)
-				if err != nil {
-					log.Error().Err(err).Send()
-				}
-
-				// _, exists := resultMap[record]
-				// if !exists {
-				// 	resultMap[record] = 1
-				// }
+			// add each found record of batch to storage
+			for record := range recordBatch {
+				ipstorage.AddUint(record)
 			}
 		}
 	}()
 
+	// file reader wg logic
+	// buffer to read from  file, size in bytes
 	buf := make([]byte, env.GetInt("DATA_CHUNK_SIZE"))
+	// we need only correct lines, so any leftovers should be passed to next batch
 	leftover := make([]byte, 0, env.GetInt("DATA_CHUNK_SIZE"))
 
 	go func() {
-		chunckCount := 0
 		for {
-			bytesRead, err := file.Read(buf)
+			// read target amount of bytes from source file
+			bytesRead, err := mmapedFile.Read(buf)
+			// if any info was found
 			if bytesRead > 0 {
 				chunk := make([]byte, bytesRead)
 				copy(chunk, buf[:bytesRead])
+				// get all full lines into validChunk, any leftovers will pass to next cycle
 				validChunk, newLeftover := processChunkWithChans(chunk, leftover)
 				leftover = newLeftover
 				if len(validChunk) > 0 {
 					parseWg.Add(1)
-					chunckCount++
-					if chunckCount % 5000 == 0 {
-						log.Info().Msg(fmt.Sprintf("Processing chunk № %d", chunckCount))
-						parseWg.Done()
-						break
-					}
+					// process info in target chunck
 					go processChunkData(validChunk, resultsChan, &parseWg)
 				}
 			}
@@ -96,30 +93,21 @@ func main() {
 			}
 		}
 		parseWg.Wait()
+		// close channels after parsing job is done
 		close(resultsChan)
 	}()
 
 	saveWg.Wait()
 
-	// err = ParseFile(file, trie)
-
-	// if err != nil {
-	// 	log.Error().Err(err).Send()
-	// 	return
-	// }
-
 	duration := time.Since(start)
-	log.Info().Msg(fmt.Sprintf("finish parsing file, took %s", duration.String()))
-	count := trie.CountUniqFullWords(trie.Root)
-	// count := len(resultMap)
-	duration = time.Since(start)
 	// show result
-	log.Info().Msg(fmt.Sprintf(`Total amount of uniq ip addresses = %d, with a total runtime of %s`, count, duration.String()))
+	log.Info().Msg(fmt.Sprintf(`Total amount of uniq ip addresses = %d, with a total runtime of %s`, ipstorage.CountUintUniq(), duration.String()))
 }
 
 func processChunkWithChans(chunk, leftover []byte) (validChunk, newLeftover []byte) {
 	firstNewline := -1
 	lastNewline := -1
+	// parsing chunk line by line, finding first and last line id
 	for i, b := range chunk {
 		if b == '\n' {
 			if firstNewline == -1 {
@@ -128,27 +116,32 @@ func processChunkWithChans(chunk, leftover []byte) (validChunk, newLeftover []by
 			lastNewline = i
 		}
 	}
+	// if new first line detected, remove all unfinished line info to leftovers,
+	//  rest to new chunk
 	if firstNewline != -1 {
 		validChunk = append(leftover, chunk[:lastNewline+1]...)
 		newLeftover = make([]byte, len(chunk[lastNewline+1:]))
 		copy(newLeftover, chunk[lastNewline+1:])
 	} else {
+		// otherwise, just add whole chunk to leftovers
 		newLeftover = append(leftover, chunk...)
 	}
 	return validChunk, newLeftover
 }
 
-func processChunkData(chunk []byte, resultsChan chan<- map[string]string, wg *sync.WaitGroup) {
+func processChunkData(chunk []byte, resultsChan chan<- map[uint32]bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	parsedIps := make(map[string]string)
+	parsedIps := make(map[uint32]bool)
 	scanner := bufio.NewScanner(strings.NewReader(string(chunk)))
 
+	// scanning batch lines one by one
 	for scanner.Scan() {
-		line := scanner.Text()
-		parsedIps[line] = line
+		// convert ips from string to uint32, so they take way less space
+		parsedIp := utils.ConvertIpToInt(scanner.Text())
+		parsedIps[parsedIp] = true
 	}
 
-	// Send the computed stats to resultsChan
+	// Send converted ips to resultsChan
 	resultsChan <- parsedIps
 }
