@@ -10,20 +10,15 @@ import (
 	"sync"
 	"time"
 
+	// public libraries with some convinient util methods for 
+	// logging and env parsing 
 	"github.com/Toscale-platform/kit/env"
 	"github.com/Toscale-platform/kit/log"
 
 	"github.com/go-mmap/mmap"
-	"github.com/joho/godotenv"
 )
 
 func main() {
-	// init env
-	err := godotenv.Load()
-	if err != nil {
-		log.Error().Err(err).Send()
-		return
-	}
 
 	start := time.Now()
 
